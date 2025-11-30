@@ -1,0 +1,31 @@
+name: Firestore Rules Test
+
+on:
+  push:
+    branches:
+      - main # or 'master', depending on your default branch name
+  pull_request:
+    branches:
+      - main # or 'master'
+
+jobs:
+  test_firestore_rules:
+    runs-on: ubuntu-latest # Using a Linux runner for consistency
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20.x' # Align with your local Node.js version
+
+      - name: Install dependencies
+        run: npm ci # 'npm ci' is preferred over 'npm install' in CI environments
+
+      - name: Run Firestore Emulator & Tests
+        # The 'firebase emulators:exec' command starts the specified emulators,
+        # runs the provided command (npm test), and then gracefully shuts down the emulators.
+        # --project is crucial to tell the CLI which Firebase project context to use.
+        run: firebase emulators:exec --only firestore --project vanatvam-booking-671c0 "npm test"
