@@ -1,0 +1,156 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Auth helpers ----------
+    function isAuthenticated() { return request.auth != null; }
+    function getUserId() { return request.auth.uid; }
+    function isAdmin() { return request.auth != null && request.auth.token.isAdmin == true; }
+
+    // ---------- Full-document validators (for create / full-replacement) ----------
+    function isValidUserProfileData(data) {
+      return data.name is string && data.name.size() > 0 &&
+             data.email is string && data.email.matches('.+@.+\\..+') &&
+             data.phone is string && data.phone.size() > 0 &&
+             data.profilePicture is string &&
+             data.createdAt is timestamp &&
+             data.isAdmin is bool;
+    }
+
+    function isValidBookingState(data) {
+      return data.userId is string &&
+             data.propertyId is string && data.propertyId.size() > 0 &&
+             data.cottageId is string && data.cottageId.size() > 0 &&
+             data.checkInDate is timestamp &&
+             data.checkOutDate is timestamp &&
+             data.checkOutDate >= data.checkInDate &&
+             data.numGuests is int && data.numGuests > 0 &&
+             data.totalPrice is number && data.totalPrice > 0 &&
+             data.status is string && data.status in ['pending','confirmed','cancelled', 'rejected'] &&
+             data.createdAt is timestamp;
+    }
+
+    // ---------- Users collection (our 'owners' collection) ----------
+    match /users/{userId} {
+      // Read: owner or admin
+      allow read: if isAuthenticated() && (userId == getUserId() || isAdmin());
+
+      // Create: owner can create their profile (must set isAdmin=false) OR admin can create any.
+      allow create: if isAuthenticated() &&
+                    (
+                      isAdmin() || (
+                        userId == getUserId() &&
+                        request.resource.data.isAdmin == false
+                      )
+                    ) &&
+                    isValidUserProfileData(request.resource.data) &&
+                    request.resource.data.keys().removeAll(['name','email','phone','profilePicture','createdAt','isAdmin']).size() == 0;
+
+      // Update: Admin has full power. Owner has restricted update permissions.
+      allow update: if isAuthenticated() && (
+         isAdmin() || // If admin, allow all updates
+         (
+           userId == getUserId() && // If owner, apply restrictions
+           // Owner cannot change 'isAdmin' or 'createdAt' fields
+           // CRITICAL: Guard resource.data access for update-like rules
+           (!('isAdmin' in request.resource.data) || (resource.data != null && request.resource.data.isAdmin == resource.data.isAdmin)) &&
+           (!('createdAt' in request.resource.data) || (resource.data != null && request.resource.data.createdAt == resource.data.createdAt)) &&
+
+           // Owner can only modify these specific fields.
+           // This checks that any field present in the update request must be one of these.
+           request.resource.data.keys().removeAll(['name','email','phone','profilePicture']).size() == 0 &&
+           request.resource.data.keys().size() > 0 && // Must update at least one field
+
+           // Validate individual fields if they are present in the request
+           ( !('name' in request.resource.data) || (request.resource.data.name is string && request.resource.data.name.size() > 0) ) &&
+           ( !('email' in request.resource.data) || (request.resource.data.email is string && request.resource.data.email.matches('.+@.+\\..+')) ) &&
+           ( !('phone' in request.resource.data) || (request.resource.data.phone is string && request.resource.data.phone.size() > 0) ) &&
+           ( !('profilePicture' in request.resource.data) || request.resource.data.profilePicture is string )
+         )
+       );
+
+      // Delete only by admin
+      allow delete: if isAdmin();
+    }
+
+    // ---------- Properties & cottages ----------
+    match /properties/{propertyId} {
+      allow read: if isAuthenticated();
+      allow create, update, delete: if isAdmin();
+
+      match /cottages/{cottageId} {
+        allow read: if isAuthenticated();
+        allow create, update, delete: if isAdmin();
+      }
+    }
+
+    // ---------- Bookings (top-level) ----------
+    match /bookings/{bookingId} {
+      // Read: owner or admin
+      allow get, list: if isAuthenticated() && (resource.data.userId == getUserId() || isAdmin());
+
+      // Create: User can only create 'pending' bookings for themselves for existing properties. Admins can create any.
+      allow create: if isAuthenticated() &&
+                    request.resource.data.userId == getUserId() && // Must be their own booking
+                    exists(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)) &&
+                    exists(/databases/$(database)/documents/properties/$(request.resource.data.propertyId)/cottages/$(request.resource.data.cottageId)) &&
+                    isValidBookingState(request.resource.data) &&
+                    request.resource.data.keys().removeAll(['userId','propertyId','cottageId','checkInDate','checkOutDate','numGuests','totalPrice','status','createdAt']).size() == 0 &&
+                    (request.resource.data.status == 'pending' || isAdmin());
+
+      // Update: Admin has full power. Owner has restricted update permissions.
+      allow update: if isAuthenticated() && (
+         isAdmin() || // If admin, allow all updates
+         (
+           resource.data != null && // Guard against null resource.data in update context
+           resource.data.userId == getUserId() && // If owner, apply restrictions
+
+           // Owner cannot change these immutable fields.
+           // We are being explicit here rather than relying solely on removeAll for clarity and robust checks.
+           !('totalPrice' in request.resource.data) &&
+           !('userId' in request.resource.data) &&
+           !('propertyId' in request.resource.data) &&
+           !('cottageId' in request.resource.data) &&
+           !('createdAt' in request.resource.data) &&
+
+           // Ensure only allowed keys for partial update are present.
+           request.resource.data.keys().removeAll(['numGuests','checkInDate','checkOutDate','status']).size() == 0 &&
+           request.resource.data.keys().size() > 0 && // Must update at least one field
+
+           // numGuests validation
+           ( !('numGuests' in request.resource.data) || (request.resource.data.numGuests is int && request.resource.data.numGuests > 0) ) &&
+           // Date range validation for partial updates
+           (
+               ( !('checkInDate' in request.resource.data) || request.resource.data.checkInDate is timestamp ) &&
+               ( !('checkOutDate' in request.resource.data) || request.resource.data.checkOutDate is timestamp ) &&
+               (
+                   ( 'checkInDate' in request.resource.data && 'checkOutDate' in request.resource.data )
+                       ? request.resource.data.checkOutDate >= request.resource.data.checkInDate
+                       : ( 'checkInDate' in request.resource.data && !('checkOutDate' in request.resource.data) )
+                           ? resource.data.checkOutDate >= request.resource.data.checkInDate
+                           : ( !('checkInDate' in request.resource.data) && 'checkOutDate' in request.resource.data )
+                               ? request.resource.data.checkOutDate >= resource.data.checkInDate
+                               : true // No dates changed, implicitly valid if not set to conflict
+               )
+           ) &&
+           // Owner can only change status to 'cancelled' (from 'pending' or 'confirmed')
+           (
+               (!('status' in request.resource.data)) || // Status not being changed OR
+               (
+                   request.resource.data.status == 'cancelled' &&
+                   resource.data.status in ['pending', 'confirmed'] // Can only cancel if pending or confirmed
+               )
+           )
+         )
+       );
+
+      // Delete: admin only
+      allow delete: if isAdmin();
+    }
+
+    // Fallback: deny everything else
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
